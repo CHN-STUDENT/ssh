@@ -21,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
 	"github.com/pkg/sftp"
 	"github.com/runletapp/go-console"
@@ -196,7 +197,14 @@ func main() {
 	flag.StringVar(&password, "password", "", "Server login password")
 	flag.BoolVar(&genT, "gt", false, "Generate new SSH key pair")
 	flag.Parse()
-	log.Println(UnloadEmbeddedDeps())
+	switch runtime.GOOS {
+	case "linux":
+	case "windows":
+		log.Println(UnloadEmbeddedDeps())
+	default:
+		log.Fatal("Can't run command on system:" + runtime.GOOS)
+		// 可以处理其他操作系统，或者提供一个默认实现
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal(err)
@@ -333,12 +341,22 @@ func main() {
 			authorizedKey := gossh.MarshalAuthorizedKey(s.PublicKey())
 			io.WriteString(s, fmt.Sprintf("used public key:\n%s", authorizedKey))
 		}
-		cmdPTY(s)
+		switch runtime.GOOS {
+		case "linux":
+			cmdPTYLinux(s)
+		case "windows":
+			cmdPTYWindows(s)
+		default:
+			log.Fatal("Can't run command on system:" + runtime.GOOS)
+			// 可以处理其他操作系统，或者提供一个默认实现
+		}
 	})
 
 	log.Println("starting ssh server on", sshd.Addr)
 	log.Fatal(sshd.ListenAndServe())
 }
+
+
 
 func generateSigner(pri, pub string) (ssh.Signer, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -426,7 +444,67 @@ func powerShell(s ssh.Session) {
     }
 }
 
-func cmdPTY(s ssh.Session) {
+// cmdPTYLinux 在Linux上为SSH会话分配一个伪终端并执行shell或命令
+func cmdPTYLinux(s ssh.Session) {
+	ptyReq, winCh, isPty := s.Pty()
+	if !isPty {
+		log.Println("PTY requested:", isPty)
+		io.WriteString(s, "PTY request was declined.\n")
+		return
+	}
+
+	// 创建一个执行shell的命令，这里以bash为例
+	shell := exec.Command("bash")
+
+	// 使用pty库分配一个伪终端
+	ptmx, err := pty.Start(shell)
+	if err != nil {
+		log.Printf("Unable to create pty: %v\n", err)
+		io.WriteString(s, "Failed to start shell.\n")
+		return
+	}
+	defer func() {
+		_ = ptmx.Close() // 尝试关闭pty
+		_ = shell.Wait() // 等待命令结束
+	}()
+
+	// 设置伪终端环境变量，例如TERM
+	if isPty {
+		pty.Setsize(ptmx, &pty.Winsize{
+			Rows: uint16(ptyReq.Window.Height),
+			Cols: uint16(ptyReq.Window.Width),
+		})
+		log.Printf("Set TERM to %s\n", ptyReq.Term)
+	}
+
+	log.Printf("Starting shell: %s\n", shell.Path)
+	
+	done := s.Context().Done()
+	go func() {
+		<-done
+		log.Println("Session done:", s.RemoteAddr())
+		ptmx.Close()
+	}()
+
+	// 监听窗口大小更改
+	go func() {
+		for win := range winCh {
+			pty.Setsize(ptmx, &pty.Winsize{
+				Rows: uint16(win.Height),
+				Cols: uint16(win.Width),
+			})
+		}
+	}()
+
+	// 处理输入输出
+	go func() {
+		io.Copy(ptmx, s) // stdin
+	}()
+	io.Copy(s, ptmx) // stdout
+}
+
+
+func cmdPTYWindows(s ssh.Session) {
 	ptyReq, winCh, isPty := s.Pty()
 
     // 假设总是分配PTY
